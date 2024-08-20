@@ -1,3 +1,9 @@
+### Acknowledgements
+Part of the code in this repository is based on work by [mikemull and dhopp1](https://github.com/mikemull/midaspy/blob/master/examples/MIDASExamples.ipynb & https://github.com/dhopp1/nowcasting_benchmark/blob/main/methodologies/model_var.ipynb).
+
+
+
+
 import datetime
 import numpy as np
 import pandas as pd
