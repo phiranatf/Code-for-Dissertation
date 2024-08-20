@@ -1,0 +1,760 @@
+import datetime
+import numpy as np
+import pandas as pd
+from scipy.optimize import least_squares
+import re
+import statsmodels.api as sm
+from itertools import product
+from statsmodels.tsa.api import VAR
+from sklearn.metrics import mean_squared_error
+from statsmodels.tsa.statespace.kalman_filter import KalmanFilter
+from statsmodels.tsa.statespace.varmax import VARMAX
+
+
+#MIDAS
+# Define Weight Methods
+class WeightMethod:
+    def __init__(self):
+        pass
+
+    def weights(self, nlags):
+        pass
+
+    def x_weighted(self, x, params):
+        pass
+
+class BetaWeights(WeightMethod):
+    def __init__(self, theta1, theta2, theta3=None):
+        self.theta1 = theta1
+        self.theta2 = theta2
+        self.theta3 = theta3
+
+    def weights(self, nlags):
+        eps = np.spacing(1)
+        u = np.linspace(eps, 1.0 - eps, nlags)
+        beta_vals = u ** (self.theta1 - 1) * (1 - u) ** (self.theta2 - 1)
+        beta_vals = beta_vals / sum(beta_vals)
+        if self.theta3 is not None:
+            w = beta_vals + self.theta3
+            return w / sum(w)
+        return beta_vals
+
+    def x_weighted(self, x, params):
+        self.theta1, self.theta2 = params
+        w = self.weights(x.shape[1])
+        return np.dot(x, w), np.tile(w.T, (x.shape[0], 1))
+
+    @property
+    def num_params(self):
+        return 2 if self.theta3 is None else 3
+
+    @staticmethod
+    def init_params():
+        return np.array([1., 5.])
+
+class ExpAlmonWeights(WeightMethod):
+    def __init__(self, theta1, theta2):
+        self.theta1 = theta1
+        self.theta2 = theta2
+
+    def weights(self, nlags):
+        ilag = np.arange(1, nlags + 1)
+        z = np.exp(self.theta1 * ilag + self.theta2 * ilag ** 2)
+        return z / sum(z)
+
+    def x_weighted(self, x, params):
+        self.theta1, self.theta2 = params
+        w = self.weights(x.shape[1])
+        return np.dot(x, w), np.tile(w.T, (x.shape[0], 1))
+
+    @property
+    def num_params(self):
+        return 2
+
+    @staticmethod
+    def init_params():
+        return np.array([-1., 0.])
+
+class UnrestrictedWeights(WeightMethod):
+    def __init__(self, nlags):
+        self.nlags = nlags
+
+    def weights(self, nlags):
+        return np.ones(nlags)
+
+    def x_weighted(self, x, params):
+        w = np.array(params)
+        return np.dot(x, w), np.tile(w.T, (x.shape[0], 1))
+
+    @property
+    def num_params(self):
+        return self.nlags
+
+    @staticmethod
+    def init_params(nlags):
+        return np.ones(nlags)
+
+
+def polynomial_weights(poly, nlags=None):
+    if poly == 'unrestricted':
+        return UnrestrictedWeights(nlags)
+    poly_class = {
+        'beta': BetaWeights(1., 5.),
+        'expalmon': ExpAlmonWeights(-1., 0.)
+    }
+    return poly_class[poly]
+
+def ssr(a, x, y, yl, weight_method):
+    xw, _ = weight_method.x_weighted(x, a[2:2 + weight_method.num_params])
+    error = y - a[0] - a[1] * xw
+    if yl is not None:
+        error -= np.dot(yl, a[2 + weight_method.num_params:])
+    return error
+
+def jacobian(a, x, y, yl, weight_method):
+    jwx = jacobian_wx(x, a[2:2 + weight_method.num_params], weight_method)
+    xw, _ = weight_method.x_weighted(x, a[2:2 + weight_method.num_params])
+    if yl is None:
+        jac_e = np.concatenate([np.ones((len(xw), 1)), xw.reshape((len(xw), 1)), (a[1] * jwx)], axis=1)
+    else:
+        jac_e = np.concatenate([np.ones((len(xw), 1)), xw.reshape((len(xw), 1)), (a[1] * jwx), yl], axis=1)
+    return -1.0 * jac_e
+
+def jacobian_wx(x, params, weight_method):
+    eps = 1e-6
+    jt = []
+    for i, p in enumerate(params):
+        dp = np.concatenate([params[0:i], [p + eps / 2], params[i + 1:]])
+        dm = np.concatenate([params[0:i], [p - eps / 2], params[i + 1:]])
+        jtp, _ = weight_method.x_weighted(x, dp)
+        jtm, _ = weight_method.x_weighted(x, dm)
+        jt.append((jtp - jtm) / eps)
+    return np.column_stack(jt)
+
+def rmse(predictions, targets):
+    return np.sqrt(((predictions - targets) ** 2).mean())
+
+def calculate_lags(lag, time_series):
+    if isinstance(lag, str):
+        return parse_lag_string(lag, data_freq(time_series)[0])
+    else:
+        return lag
+
+def data_freq(time_series):
+    try:
+        freq = time_series.index.freq
+        return freq.freqstr or pd.infer_freq(time_series.index)
+    except AttributeError:
+        return pd.infer_freq(time_series.index)
+
+def parse_lag_string(lag_string, freq):
+    freq_map = {
+        'd': {'m': 30, 'd': 1},
+        'b': {'m': 22, 'b': 1},
+        'm': {'q': 3, 'm': 1},
+        'q': {'y': 4},
+        'a': {'y': 1}
+    }
+    m = re.match(r'(\d+)(\w)', lag_string)
+    duration = int(m.group(1))
+    period = m.group(2).lower()
+    return duration * freq_map[freq.lower()][period]
+
+def mix_freq(lf_data, hf_data, xlag, ylag, horizon, start_date=None, end_date=None):
+    lf_data.sort_index(inplace=True)
+    hf_data.sort_index(inplace=True)
+
+    ylag = calculate_lags(ylag, lf_data)
+    xlag = calculate_lags(xlag, hf_data)
+
+    min_date_y = lf_data.index[max(ylag, 1)]
+    min_date_x = hf_data.index[xlag + horizon]
+
+    if min_date_y < min_date_x:
+        min_date_y = next(d for d in list(lf_data.index) if d > min_date_x)
+
+    if (start_date is None) or (start_date < min_date_y):
+        start_date = min_date_y
+    if end_date is None:
+        end_date = lf_data.index[-2]
+
+    max_date = lf_data.index[-1]
+    if max_date > hf_data.index[-1]:
+        max_date = next(d for d in reversed(list(lf_data.index)) if d < hf_data.index[-1])
+
+    if end_date > max_date:
+        end_date = max_date
+
+    forecast_start_date = lf_data.index[lf_data.index.get_loc(end_date) + 1]
+
+    ylags = None
+    if ylag > 0:
+        ylags = pd.concat([lf_data.shift(l) for l in range(1, ylag + 1)], axis=1)
+
+    x_rows = []
+    for lfdate in lf_data.loc[start_date:max_date].index:
+        start_hf = hf_data.index.asof(lfdate)
+        start_hf_loc = hf_data.index.get_loc(start_hf)
+        x_rows.append(hf_data.iloc[start_hf_loc - horizon: start_hf_loc - xlag - horizon: -1].values)
+
+    x = pd.DataFrame(data=x_rows, index=lf_data.loc[start_date:max_date].index)
+
+    return (lf_data.loc[start_date:end_date],
+            ylags.loc[start_date:end_date] if ylag > 0 else None,
+            x.loc[start_date:end_date],
+            lf_data[forecast_start_date:max_date],
+            ylags[forecast_start_date:max_date] if ylag > 0 else None,
+            x.loc[forecast_start_date:])
+
+# Main estimation and forecasting functions
+def estimate(y, yl, x, poly='beta'):
+    weight_method = polynomial_weights(poly, x.shape[1])
+    if poly == 'unrestricted':
+        xw, w = weight_method.x_weighted(x.values, weight_method.init_params(x.shape[1]))
+    else:
+        xw, w = weight_method.x_weighted(x.values, weight_method.init_params())
+
+    if yl is not None:
+        c = np.linalg.lstsq(np.concatenate([np.ones((len(xw), 1)), xw.reshape((len(xw), 1)), yl], axis=1), y.values, rcond=None)[0]
+    else:
+        c = np.linalg.lstsq(np.concatenate([np.ones((len(xw), 1)), xw.reshape((len(xw), 1))], axis=1), y.values, rcond=None)[0]
+
+    f = lambda v: ssr(v, x.values, y.values, yl.values if yl is not None else None, weight_method)
+    jac = lambda v: jacobian(v, x.values, y.values, yl.values if yl is not None else None, weight_method)
+
+    init_params = weight_method.init_params(x.shape[1]) if poly == 'unrestricted' else weight_method.init_params()
+    param_vector = np.concatenate([c[0:2], init_params, c[2:] if yl is not None else []])
+
+    opt_res = least_squares(f,
+                            param_vector,
+                            jac,
+                            xtol=1e-9,
+                            ftol=1e-9,
+                            max_nfev=5000,
+                            verbose=0)
+
+    return opt_res
+
+def forecast(xfc, yfcl, res, poly='beta'):
+    weight_method = polynomial_weights(poly, xfc.shape[1])
+
+    a, b, *theta = res.x[:2 + weight_method.num_params]
+    l = res.x[2 + weight_method.num_params:] if len(res.x) > 2 + weight_method.num_params else []
+
+    xw, w = weight_method.x_weighted(xfc.values, theta)
+
+    yf = a + b * xw
+    if yfcl is not None:
+        for i in range(yfcl.shape[1]):
+            yf += l[i] * yfcl.values[:, i]
+
+    return pd.DataFrame(yf, index=xfc.index, columns=['yfh'])
+
+def midas_adl(y_in, x_in, start_date, end_date, xlag, ylag, horizon, forecast_horizon=1, poly='beta', method='fixed'):
+    methods = {'fixed': fixed_window,
+               'rolling': rolling,
+               'recursive': recursive}
+
+    return methods[method](y_in, x_in, start_date, end_date, xlag, ylag, horizon, forecast_horizon, poly)
+
+def fixed_window(y_in, x_in, start_date, end_date, xlag, ylag, horizon, forecast_horizon=1, poly='beta'):
+    y, yl, x, yf, ylf, xf = mix_freq(y_in, x_in, xlag, ylag, horizon,
+                                     start_date=start_date,
+                                     end_date=end_date)
+
+    res = estimate(y, yl, x, poly=poly)
+
+    fc = forecast(xf, ylf, res, poly=poly)
+
+    return (rmse(fc.yfh, yf),
+            pd.DataFrame({'preds': fc.yfh, 'targets': yf}, index=yf.index))
+
+def rolling(y_in, x_in, start_date, end_date, xlag, ylag, horizon, forecast_horizon=1, poly='beta'):
+    preds = []
+    targets = []
+    dt_index = []
+    start_loc = y_in.index.get_loc(start_date)
+    window_size = 60
+    if end_date is not None:
+        end_loc = y_in.index.get_loc(end_date)
+        window_size = end_loc - start_loc
+
+    while start_loc + window_size < (len(y_in.index) - forecast_horizon):
+        y, yl, x, yf, ylf, xf = mix_freq(y_in, x_in, xlag, ylag, horizon,
+                                         start_date=y_in.index[start_loc],
+                                         end_date=y_in.index[start_loc + window_size])
+        if len(xf) - forecast_horizon <= 0:
+            break
+
+        res = estimate(y, yl, x, poly=poly)
+
+        fc = forecast(xf, ylf, res, poly=poly)
+
+        preds.append(fc.iloc[forecast_horizon - 1].values[0])
+        targets.append(yf.iloc[forecast_horizon - 1])
+        dt_index.append(yf.index[forecast_horizon - 1])
+
+        start_loc += 1
+
+    preds = np.array(preds)
+    targets = np.array(targets)
+
+    return (rmse(preds, targets),
+            pd.DataFrame({'preds': preds, 'targets': targets}, index=pd.DatetimeIndex(dt_index)))
+
+def recursive(y_in, x_in, start_date, end_date, xlag, ylag, horizon, forecast_horizon=1, poly='beta'):
+    preds = []
+    targets = []
+    dt_index = []
+
+    forecast_start_loc = y_in.index.get_loc(end_date)
+
+    model_end_dates = y_in.index[forecast_start_loc:-forecast_horizon]
+
+    for estimate_end in model_end_dates:
+        y, yl, x, yf, ylf, xf = mix_freq(y_in, x_in, xlag, ylag, horizon,
+                                         start_date=start_date,
+                                         end_date=estimate_end)
+        if len(xf) - forecast_horizon <= 0:
+            break
+
+        res = estimate(y, yl, x, poly=poly)
+
+        fc = forecast(xf, ylf, res, poly=poly)
+
+        preds.append(fc.iloc[forecast_horizon - 1].values[0])
+        targets.append(yf.iloc[forecast_horizon - 1])
+        dt_index.append(yf.index[forecast_horizon - 1])
+
+    preds = np.array(preds)
+    targets = np.array(targets)
+
+    return (rmse(preds, targets),
+            pd.DataFrame({'preds': preds, 'targets': targets}, index=pd.DatetimeIndex(dt_index)))
+
+def evaluate_midas(forecast_horizons, gdp_data, pay_data, start_date, end_date, xlag, ylag, horizon, poly, method):
+    results = {}
+    for forecast_horizon in forecast_horizons:
+        result = midas_adl(
+            gdp_data, pay_data,
+            start_date=start_date,
+            end_date=end_date,
+            xlag=xlag,
+            ylag=ylag,
+            horizon=horizon,
+            forecast_horizon=forecast_horizon,
+            poly=poly,
+            method=method
+        )
+        results[forecast_horizon] = {
+            'RMSE': result[0],
+            'Details': result[1]
+        }
+    return results
+
+gdp_data = pd.read_csv('gdp_X.csv', parse_dates=['DATE'], index_col='DATE').sort_index()
+
+def rmse(predictions, targets):
+    return np.sqrt(((predictions - targets) ** 2).mean())
+
+# Set up the date ranges
+train_start_date = "1962-01-01"
+train_end_date = "2016-12-01"
+test_start_date = "2017-01-01"
+test_end_date = "2023-03-01"
+
+# Assuming `gdp_data` is a DataFrame with a 'GDP' column
+# Resample the data to quarterly frequency if necessary
+data_quarterly = gdp_data  # Assuming data is already in quarterly frequency
+
+# Split the data into training and testing sets
+train_data = data_quarterly[train_start_date:train_end_date]
+test_data = data_quarterly[test_start_date:test_end_date]
+
+# Prepare the dependent variable for the training set
+gdp_train = train_data['GDP']
+gdp_train_lagged = gdp_train.shift(1).dropna()
+aligned_gdp_train = gdp_train.loc[gdp_train_lagged.index]
+
+
+X_train = gdp_train_lagged
+
+# Fit the AR(1) model
+model = sm.OLS(aligned_gdp_train, X_train).fit()
+
+print(f"AR(1) model coefficients (no intercept):\n{model.params}\n")
+
+# Prepare the test data for forecasting
+gdp_test = test_data['GDP']
+gdp_test_lagged = gdp_test.shift(1)
+
+# Forecasting settings
+forecast_horizons = [1, 2, 4, 6, 8]
+rmse_results = {str(horizon): [] for horizon in forecast_horizons}
+
+# Perform forecasting for the test period using the trained AR(1) model
+for horizon in forecast_horizons:
+    rmse_values = []
+    print(f"Results for Forecast Horizon {horizon}")
+    print(f"{'Horizon':<10} {'Actual':<15} {'Forecasted':<20} {'RMSE':<10}")
+
+    for step in range(len(gdp_test) - horizon):
+        # Prepare the input for forecasting (ensure the same structure as during training)
+        X_forecast = pd.DataFrame([gdp_test_lagged.iloc[step + 1]])
+        forecasted_value = model.predict(X_forecast)[0]
+        actual_value = gdp_test.iloc[step + horizon]
+
+        # Calculate RMSE
+        rmse_value = rmse(np.array([actual_value]), np.array([forecasted_value]))
+        rmse_values.append(rmse_value)
+        print(f"{step + 1:<10} {actual_value:<15.4f} {forecasted_value:<20.4f} {rmse_value:<10.4f}")
+
+    mean_rmse = np.mean(rmse_values) if rmse_values else float('nan')
+    rmse_results[str(horizon)].append(mean_rmse)
+    print(f"Mean RMSE across all horizons for Forecast Horizon {horizon}: {mean_rmse}")
+    print()
+
+# Display final RMSE results
+print("Final RMSE results:")
+for horizon in forecast_horizons:
+    rmse_values = rmse_results[str(horizon)]
+    if isinstance(rmse_values, list):
+        formatted_values = ', '.join(f"{value:.4f}" for value in rmse_values)
+    else:
+        formatted_values = f"{rmse_values:.4f}"
+    print(f"Forecast Horizon {horizon}: {formatted_values}")
+
+def rmse(predictions, targets):
+    return np.sqrt(((predictions - targets) ** 2).mean())
+
+# Resample the data to quarterly frequency
+data_quarterly = gdp_data.resample('Q').mean().dropna()
+
+# Prepare the dependent variable
+gdp = data_quarterly['GDP']
+
+# Fit the AR model and select the optimal lags using BIC
+bic_values = []
+max_lag = 10
+
+# Generate all possible combinations of lags for GDP
+for lag_gdp in range(1, max_lag + 1):
+    # Create lagged variables
+    lagged_gdp = gdp.shift(lag_gdp).dropna()
+    # Align the variables
+    aligned_gdp = gdp.loc[lagged_gdp.index]
+    aligned_lagged_gdp = lagged_gdp
+    # Combine into a DataFrame
+    X = aligned_lagged_gdp
+    X = sm.add_constant(X)
+    # Fit the model
+    model = sm.OLS(aligned_gdp, X).fit()
+    bic_values.append((lag_gdp, model.bic))
+
+# Get the optimal lag according to BIC
+optimal_lag = min(bic_values, key=lambda x: x[1])[0]
+
+print(f"The optimal lag according to BIC is: GDP lag = {optimal_lag}")
+
+# Forecasting settings
+forecast_horizons = [1, 2, 4, 6, 8]
+rmse_results = {str(horizon): [] for horizon in forecast_horizons}
+
+# Generate the lagged data for the optimal lag
+gdp_lagged = gdp.shift(optimal_lag).dropna()
+aligned_gdp = gdp.loc[gdp_lagged.index]
+X = sm.add_constant(gdp_lagged)
+model = sm.OLS(aligned_gdp, X).fit()
+
+# Perform recursive forecasting
+for horizon in forecast_horizons:
+    rmse_values = []
+    print(f"Results for Forecast Horizon {horizon}")
+    print(f"{'Horizon':<10} {'Actual':<15} {'Forecasted':<20} {'RMSE':<10}")
+
+    for step in range(len(gdp) - optimal_lag - horizon + 1):
+        # Fit the model up to the current step
+        X_train = X.iloc[:step + optimal_lag]
+        y_train = aligned_gdp.iloc[:step + optimal_lag]
+        model = sm.OLS(y_train, X_train).fit()
+
+        # Forecast the next value
+        X_forecast = sm.add_constant(gdp.iloc[step + optimal_lag])
+        forecasted_value = model.predict(X_forecast)[0]
+        actual_value = gdp.iloc[step + optimal_lag + horizon - 1]
+
+        # Calculate RMSE
+        rmse_value = rmse(np.array([actual_value]), np.array([forecasted_value]))
+        rmse_values.append(rmse_value)
+        print(f"{step + 1:<10} {actual_value:<15.4f} {forecasted_value:<20.4f} {rmse_value:<10.4f}")
+
+    mean_rmse = np.mean(rmse_values) if rmse_values else float('nan')
+    rmse_results[str(horizon)].append(mean_rmse)
+    print(f"Mean RMSE across all horizons for Forecast Horizon {horizon}: {mean_rmse}")
+    print()
+
+# Display final RMSE results
+print("Final RMSE results:")
+for horizon in forecast_horizons:
+    rmse_values = rmse_results[str(horizon)]
+    if isinstance(rmse_values, list):
+        formatted_values = ', '.join(f"{value:.4f}" for value in rmse_values)
+    else:
+        formatted_values = f"{rmse_values:.4f}"
+    print(f"Forecast Horizon {horizon}: {formatted_values}")
+
+# Combine the datasets
+data = pd.concat([gdp_data, pay_data], axis=1).dropna()
+
+# Resample the data to quarterly frequency
+data_quarterly = data.resample('Q').mean().dropna()
+
+# Fit the VAR model
+model = VAR(data_quarterly)
+
+# Select the optimal lag length using BIC
+lag_selection = model.select_order(maxlags=6)
+
+# Print the BIC values for all tested lags
+print("BIC values for different lags:")
+print(lag_selection.summary())
+
+# Extract the optimal lag length based on BIC
+optimal_lag = lag_selection.bic
+
+print(f"The optimal lag length according to BIC is: {optimal_lag}")
+
+
+
+Start=datetime.datetime(1991, 1, 1)
+
+
+
+
+all_results_ylag_1 = evaluate_midas(
+    forecast_horizons,
+    gdp_data['GDP'],
+    pay_data['PAY'],
+    start_date=Start,
+    end_date=datetime.datetime(2017, 1, 1),
+    xlag=3,
+    ylag=1,
+    horizon=3,
+    poly='expalmon',
+    method='recursive'
+)
+
+
+
+all_results_ylag_0 = evaluate_midas(
+    forecast_horizons,
+    gdp_data['GDP'],
+    pay_data['PAY'],
+    start_date=Start,
+    end_date=datetime.datetime(2017, 1, 1),
+    xlag=3,
+    ylag=0,
+    horizon=3,
+    poly='unrestricted',
+    method='recursive'
+)
+
+
+
+# To print RMSE for all forecast horizons
+print("Results with ylag = 1:")
+for forecast_horizon, details in all_results_ylag_1.items():
+    print(f"Forecast Horizon {forecast_horizon}: RMSE = {details['RMSE']:.4f}")
+
+print("Results with ylag = 0:")
+for forecast_horizon, details in all_results_ylag_0.items():
+    print(f"Forecast Horizon {forecast_horizon}: RMSE = {details['RMSE']:.4f}")
+
+import pandas as pd
+
+def save_combined_forecasted_values_to_excel(results_ylag_1, results_ylag_0, forecast_horizons, filename):
+    combined_data = []
+
+    def add_forecasted_values(results, ylag_label):
+        for forecast_horizon in forecast_horizons:
+            if forecast_horizon in results:
+                details = results[forecast_horizon]['Details']
+                # Add columns for ylag and forecast horizon
+                details['ylag'] = ylag_label
+                details['forecast_horizon'] = forecast_horizon
+                combined_data.append(details)
+            else:
+                print(f"Forecast Horizon {forecast_horizon} not found in results for {ylag_label}")
+
+    # Add data for ylag = 1
+    add_forecasted_values(results_ylag_1, 'ylag = 1')
+
+    # Add data for ylag = 0
+    add_forecasted_values(results_ylag_0, 'ylag = 0')
+
+    # Combine all data into a single DataFrame
+    combined_df = pd.concat(combined_data)
+
+    # Save to Excel
+    combined_df.to_excel(filename, index=False)
+    print(f"Combined forecasted values saved to {filename}")
+
+
+forecast_horizons = [1, 2, 4, 6, 8]
+save_combined_forecasted_values_to_excel(all_results_ylag_1, all_results_ylag_0, forecast_horizons, 'combined_forecasted_values.xlsx')
+
+
+#MF-VAR
+
+
+train_start_date = "1980-03-01"
+train_end_date = "2017-02-01"
+test_start_date = "2017-03-01"
+test_end_date = "2023-03-01"
+
+#Forecast or Nowcast
+
+def gen_lagged_data(metadata, data, last_date, lag=0):
+    lagged_data = data.loc[data.date <= last_date, :].reset_index(drop=True)
+    for col in lagged_data.columns[1:]:  # Skip the date column
+        if col == 'gdpc1':
+            continue  # Skip processing for gdpc1
+        pub_lag = metadata.loc[metadata.series == col, "months_lag"].values[0]
+        print(f"Processing column: {col}, Publication lag: {pub_lag}")  # Debugging information
+        for index in range(len(lagged_data)):
+            # Apply only publication lag from metadata here
+            effective_index = index + pub_lag
+            if effective_index < 0 or effective_index >= len(lagged_data):
+                lagged_data.loc[index, col] = np.nan
+            else:
+                # Optionally apply an additional lag to all columns except 'gdpc1' or specific columns
+                effective_index += lag
+                if effective_index >= len(lagged_data):
+                    lagged_data.loc[index, col] = np.nan
+                else:
+                    lagged_data.loc[index, col] = lagged_data.loc[effective_index, col]
+    return lagged_data
+
+
+data = pd.read_csv('data_tf.csv', parse_dates=["date"])
+metadata = pd.read_csv('meta_data.csv')
+
+
+lagged_data_before_test_start = gen_lagged_data(metadata, data, test_start_date, 2)
+
+# Display the affected data
+affected_data_before_test_start = lagged_data_before_test_start.loc[
+    lagged_data_before_test_start.date < test_start_date, :
+]
+
+print(affected_data_before_test_start.tail(30))
+
+#MF-VAR Main code
+
+
+def gen_lagged_data(metadata, data, last_date, lag):
+    lagged_data = data.loc[data.date <= last_date, :].reset_index(drop=True)
+    for col in lagged_data.columns[1:]:  # Skip the date column
+        if col == 'gdpc1':
+            continue  # Skip processing for gdpc1
+        pub_lag = metadata.loc[metadata.series == col, "months_lag"].values[0]
+
+        for index in range(len(lagged_data)):
+            # Apply only publication lag from metadata here
+            effective_index = index + pub_lag
+            if effective_index < 0 or effective_index >= len(lagged_data):
+                lagged_data.loc[index, col] = np.nan
+            else:
+                # Optionally apply an additional lag to all columns except 'gdpc1' or specific columns
+                effective_index += lag
+                if effective_index >= len(lagged_data):
+                    lagged_data.loc[index, col] = np.nan
+                else:
+                    lagged_data.loc[index, col] = lagged_data.loc[effective_index, col]
+    return lagged_data
+
+# Main Workflow
+data = pd.read_csv('data_tf_X.csv', parse_dates=["date"])
+metadata = pd.read_csv('meta_data.csv')
+target_variable = "gdpc1"
+lags = [0, 2]
+
+train_start_date = "1990-02-01"
+train_end_date = "2017-02-01"
+test_start_date = "2017-03-01"
+test_end_date = "2023-03-01"
+
+test = data.loc[(data.date >= train_start_date) & (data.date <= test_end_date), :].reset_index(drop=True)
+
+dates = pd.date_range(test_start_date, test_end_date, freq="3MS").strftime("%Y-%m-%d").tolist()
+actuals = list(test.loc[test.date.isin(dates), target_variable].values)
+
+pred_dict = {str(k): {h: [] for h in range(1, 11)} for k in lags}
+
+for lag in lags:
+    for horizon in range(1, 11):
+        for date_index, date in enumerate(dates):
+            try:
+                # Generate lagged data
+                flattened = gen_lagged_data(metadata, test, date, lag)
+                flattened[target_variable] = flattened[target_variable].shift(3)
+                flattened.loc[flattened.date == date, target_variable] = np.nan
+
+                flattened = flattened.interpolate(method='linear', limit_direction='forward').bfill()
+
+                if not flattened.drop(['date', target_variable], axis=1).empty:
+                    # Fitting the VARMAX model
+                    model = VARMAX(flattened.loc[:, flattened.columns != 'date'], order=(1, 1), trend='n')
+                    results = model.fit(method='lbfgs', maxiter=10000, pgtol=1e-100, disp=False)
+
+                    # Forecasting the next step
+                    forecasted_values = results.forecast(steps=horizon)
+                    forecasted_value = forecasted_values.iloc[-1][target_variable]
+                    pred_dict[str(lag)][horizon].append(forecasted_value)
+
+                    # Rolling the dataset forward with the forecasted value
+                    if horizon > 1 and date_index + horizon < len(dates):
+                        next_date = dates[date_index + horizon]
+                        if next_date in test.date.values:  # Ensure next_date is within test data
+                            test.loc[test.date == next_date, target_variable] = forecasted_value
+
+            except Exception as e:
+                print(f"Error processing lag {lag} on date {date} with horizon {horizon}: {e}")
+
+def rmse(predictions, targets):
+      return np.sqrt(((predictions - targets) ** 2).mean())
+
+forecast_horizons = [1, 2, 4, 6, 8]
+rmse_results = {str(horizon): [] for horizon in forecast_horizons}
+
+for horizon in forecast_horizons:
+    for lag in lags:
+        rmse_values = []
+        print(f"Results for Lag {lag}, Forecast Horizon {horizon}")
+        print(f"{'Horizon':<10} {'Actual':<15} {'Forecasted':<20} {'RMSE':<10}")
+
+        for step in range(len(dates) - horizon + 1):
+            actual_value = actuals[step + horizon - 1]
+            try:
+                forecasted_value = pred_dict[str(lag)][horizon][step]
+                rmse_value = rmse(np.array([actual_value]), np.array([forecasted_value]))
+                rmse_values.append(rmse_value)
+                print(f"{step + 1:<10} {actual_value:<15.4f} {forecasted_value:<20.4f} {rmse_value:<10.4f}")
+            except IndexError:
+                print(f"IndexError for lag {lag} at step {step}: pred_dict has {len(pred_dict[str(lag)][horizon])} elements")
+                break
+        mean_rmse = np.mean(rmse_values) if rmse_values else float('nan')
+        rmse_results[str(horizon)].append(mean_rmse)
+        print(f"Mean RMSE across all horizons for lag {lag}: {mean_rmse}")
+        print()
+
+print("Final RMSE results:")
+for horizon in forecast_horizons:
+    rmse_values = rmse_results[str(horizon)]
+    if isinstance(rmse_values, list):
+        formatted_values = ', '.join(f"{value:.4f}" for value in rmse_values)
+    else:
+        formatted_values = f"{rmse_values:.4f}"
+    print(f"Forecast Horizon {horizon}: {formatted_values}")
+
+
